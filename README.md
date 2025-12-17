@@ -45,6 +45,17 @@ Generate inventory-api schema cache:
 ansible-playbook schema-setup.yaml
 ```
 
+This playbook:
+1. Creates the schema directory structure in inventory-api
+2. Templates config.yaml and copies JSON schema files
+3. Runs `go run main.go preload-schema` in the inventory-api directory
+
+The preload-schema command reads the schema files from `data/schema/resources/` and generates `schema_cache.json` at the repository root. This cache file is mounted into the inventory-api container at runtime.
+
+Requirements:
+- Go installed and in PATH
+- inventory-api repository at `../inventory-api` (relative to ansible directory)
+
 ### 2. Start Infrastructure
 
 ```
