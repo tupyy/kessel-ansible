@@ -1,0 +1,455 @@
+---
+- name: Start Kessel Infrastructure (PostgreSQL, Kafka KRaft, Invmigrate)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/main.yaml
+
+  tasks:
+    # ============================================================
+    # Config Setup
+    # ============================================================
+    - name: Template inventory config to temp location
+      ansible.builtin.template:
+        src: "{{ inventory_config_path }}"
+        dest: /tmp/inventory-api-config.yaml
+        mode: '0644'
+
+    # ============================================================
+    # Network Setup
+    # ============================================================
+    - name: Create kessel network
+      containers.podman.podman_network:
+        name: "{{ network_name }}"
+        state: present
+
+    # ============================================================
+    # PostgreSQL
+    # ============================================================
+    - name: Create PostgreSQL data volume
+      containers.podman.podman_volume:
+        name: postgres-data
+        state: present
+
+    - name: Start PostgreSQL container
+      containers.podman.podman_container:
+        name: "{{ postgres_container }}"
+        image: "{{ postgres_image }}"
+        state: started
+        recreate: false
+        network:
+          - "{{ network_name }}"
+        ports:
+          - "{{ postgres_port }}:5432"
+        volumes:
+          - postgres-data:/var/lib/postgresql/data:Z
+        env:
+          POSTGRES_USER: "{{ postgres_user }}"
+          POSTGRES_PASSWORD: "{{ postgres_password }}"
+          POSTGRES_DB: "{{ postgres_db }}"
+        command:
+          - "-c"
+          - "port=5432"
+          - "-c"
+          - "track_commit_timestamp=on"
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U {{ postgres_user }} -d {{ postgres_db }}"]
+          interval: 5s
+          timeout: 5s
+          retries: 5
+
+    - name: Wait for PostgreSQL to be ready
+      containers.podman.podman_container_exec:
+        name: "{{ postgres_container }}"
+        command: pg_isready -U {{ postgres_user }} -d {{ postgres_db }}
+      register: pg_ready
+      until: pg_ready.rc == 0
+      retries: 30
+      delay: 2
+
+    # ============================================================
+    # Kafka (KRaft mode - no Zookeeper)
+    # ============================================================
+    - name: Check if Kafka is already formatted
+      containers.podman.podman_volume_info:
+        name: kafka-data
+      register: kafka_volume
+      ignore_errors: true
+
+    - name: Create Kafka data volume
+      containers.podman.podman_volume:
+        name: kafka-data
+        state: present
+
+    - name: Create Kafka logs volume
+      containers.podman.podman_volume:
+        name: kafka-logs
+        state: present
+
+    - name: Format Kafka storage for KRaft
+      containers.podman.podman_container:
+        name: kafka-format
+        image: "{{ kafka_image }}"
+        state: started
+        detach: false
+        rm: true
+        volumes:
+          - kafka-data:/tmp/kraft-combined-logs:Z
+        env:
+          LOG_DIR: "/tmp/logs"
+          KAFKA_LOG4J_OPTS: "-Dlog4j.configuration=file:/opt/kafka/config/log4j.properties"
+          KAFKA_HEAP_OPTS: "-Xmx256M -Xms256M"
+          KAFKA_JVM_PERFORMANCE_OPTS: ""
+        command:
+          - sh
+          - -c
+          - |
+            mkdir -p /tmp/logs
+            if [ ! -f /tmp/kraft-combined-logs/meta.properties ]; then
+              echo "Formatting Kafka storage..."
+              bin/kafka-storage.sh format -t {{ kafka_cluster_id }} -c config/kraft/server.properties --ignore-formatted
+              echo "Format complete"
+            else
+              echo "Already formatted"
+            fi
+      register: kafka_format
+
+    - name: Show format output
+      debug:
+        var: kafka_format.stdout_lines
+      when: kafka_format.stdout_lines is defined
+
+    - name: Start Kafka container (KRaft mode)
+      containers.podman.podman_container:
+        name: "{{ kafka_container }}"
+        image: "{{ kafka_image }}"
+        state: started
+        recreate: false
+        network:
+          - "{{ network_name }}"
+        ports:
+          - "{{ kafka_external_port }}:9092"
+          - "{{ kafka_internal_port }}:9093"
+        volumes:
+          - kafka-data:/tmp/kraft-combined-logs:Z
+        env:
+          LOG_DIR: "/tmp/logs"
+          KAFKA_LOG4J_OPTS: "-Dlog4j.configuration=file:/opt/kafka/config/log4j.properties"
+          KAFKA_HEAP_OPTS: "-Xmx512M -Xms512M"
+          KAFKA_JVM_PERFORMANCE_OPTS: ""
+        command:
+          - sh
+          - -c
+          - |
+            mkdir -p /tmp/logs &&
+            bin/kafka-server-start.sh config/kraft/server.properties \
+              --override node.id=1 \
+              --override process.roles=broker,controller \
+              --override listeners=PLAINTEXT://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094,EXTERNAL://0.0.0.0:9092 \
+              --override advertised.listeners=PLAINTEXT://kafka:9093,EXTERNAL://localhost:9092 \
+              --override listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT \
+              --override controller.quorum.voters=1@localhost:9094 \
+              --override controller.listener.names=CONTROLLER \
+              --override inter.broker.listener.name=PLAINTEXT
+
+    - name: Wait for Kafka to be ready
+      containers.podman.podman_container_exec:
+        name: "{{ kafka_container }}"
+        command: bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9093
+      register: kafka_ready
+      until: kafka_ready.rc == 0
+      retries: 30
+      delay: 3
+      ignore_errors: true
+
+    # ============================================================
+    # Inventory API Migration
+    # ============================================================
+    - name: Run invmigrate container
+      containers.podman.podman_container:
+        name: "{{ invmigrate_container }}"
+        image: "{{ inventory_api_image }}"
+        state: started
+        recreate: true
+        network:
+          - "{{ network_name }}"
+        volumes:
+          - /tmp/inventory-api-config.yaml:/inventory-api-compose.yaml:ro,Z
+        env:
+          INVENTORY_API_CONFIG: /inventory-api-compose.yaml
+        command:
+          - migrate
+      register: invmigrate_result
+
+    - name: Wait for invmigrate to complete
+      containers.podman.podman_container_info:
+        name: "{{ invmigrate_container }}"
+      register: invmigrate_info
+      until: invmigrate_info.containers[0].State.Status != "running"
+      retries: 60
+      delay: 2
+
+    - name: Check invmigrate exit code
+      debug:
+        msg: "Invmigrate completed with exit code: {{ invmigrate_info.containers[0].State.ExitCode }}"
+
+    - name: Fail if invmigrate failed
+      fail:
+        msg: "Invmigrate failed with exit code {{ invmigrate_info.containers[0].State.ExitCode }}"
+      when: invmigrate_info.containers[0].State.ExitCode != 0
+
+    # ============================================================
+    # SpiceDB Migration
+    # ============================================================
+    - name: Run SpiceDB migration
+      containers.podman.podman_container:
+        name: spicedb-migrate
+        image: "{{ spicedb_image }}"
+        state: started
+        detach: false
+        rm: true
+        network:
+          - "{{ network_name }}"
+        env:
+          SPICEDB_DATASTORE_ENGINE: postgres
+          SPICEDB_DATASTORE_CONN_URI: "postgres://{{ postgres_user }}:{{ postgres_password }}@{{ postgres_container }}:5432/{{ postgres_db }}?sslmode=disable"
+        command:
+          - migrate
+          - head
+      register: spicedb_migrate
+
+    - name: Show SpiceDB migration output
+      debug:
+        var: spicedb_migrate.stdout_lines
+      when: spicedb_migrate.stdout_lines is defined
+
+    # ============================================================
+    # Level 3: Kafka Topics Setup
+    # ============================================================
+    - name: Create Kafka topics
+      containers.podman.podman_container:
+        name: kafka-setup
+        image: "{{ kafka_image }}"
+        state: started
+        detach: false
+        rm: true
+        network:
+          - "{{ network_name }}"
+        env:
+          LOG_DIR: "/tmp/logs"
+          KAFKA_LOG4J_OPTS: "-Dlog4j.configuration=file:/opt/kafka/config/log4j.properties"
+          KAFKA_HEAP_OPTS: "-Xmx256M -Xms256M"
+          KAFKA_JVM_PERFORMANCE_OPTS: ""
+        command:
+          - sh
+          - -c
+          - |
+            mkdir -p /tmp/logs
+            echo "Creating Kafka topics..."
+            bin/kafka-topics.sh --bootstrap-server kafka:9093 --create --if-not-exists --topic outbox.event.kessel.resources --replication-factor 1 --partitions 1
+            bin/kafka-topics.sh --bootstrap-server kafka:9093 --create --if-not-exists --topic outbox.event.kessel.tuples --replication-factor 1 --partitions 1
+            echo "Topics created:"
+            bin/kafka-topics.sh --bootstrap-server kafka:9093 --list
+      register: kafka_setup
+
+    - name: Show Kafka topics output
+      debug:
+        var: kafka_setup.stdout_lines
+      when: kafka_setup.stdout_lines is defined
+
+    # ============================================================
+    # Level 3: Kafka Connect (Debezium)
+    # ============================================================
+    - name: Start Kafka Connect container
+      containers.podman.podman_container:
+        name: "{{ connect_container }}"
+        image: "{{ connect_image }}"
+        state: started
+        recreate: false
+        network:
+          - "{{ network_name }}"
+        ports:
+          - "{{ connect_port }}:8083"
+        env:
+          GROUP_ID: "1"
+          CONFIG_STORAGE_TOPIC: my_connect_configs
+          OFFSET_STORAGE_TOPIC: my_connect_offsets
+          STATUS_STORAGE_TOPIC: my_connect_statuses
+          BOOTSTRAP_SERVERS: kafka:9093
+
+    - name: Wait for Kafka Connect to be ready
+      uri:
+        url: "http://localhost:{{ connect_port }}/connectors"
+        method: GET
+        status_code: 200
+      register: connect_ready
+      until: connect_ready.status == 200
+      retries: 60
+      delay: 3
+      ignore_errors: false
+
+    # ============================================================
+    # Level 3: Inventory API
+    # ============================================================
+    - name: Start Inventory API container
+      containers.podman.podman_container:
+        name: "{{ inventory_api_container }}"
+        image: "{{ inventory_api_image }}"
+        state: started
+        recreate: false
+        network:
+          - "{{ network_name }}"
+        ports:
+          - "{{ inventory_http_port }}:{{ inventory_http_port }}"
+          - "{{ inventory_grpc_port }}:{{ inventory_grpc_port }}"
+        volumes:
+          - /tmp/inventory-api-config.yaml:/inventory-api-compose.yaml:ro,Z
+          - "{{ inventory_api_path }}/schema_cache.json:/schema_cache.json:ro,Z"
+        env:
+          INVENTORY_API_CONFIG: /inventory-api-compose.yaml
+        command:
+          - serve
+
+    - name: Wait for Inventory API to be ready
+      uri:
+        url: "http://localhost:{{ inventory_http_port }}/api/inventory/v1/livez"
+        method: GET
+        status_code: [200, 204]
+      register: inventory_ready
+      until: inventory_ready.status in [200, 204]
+      retries: 30
+      delay: 2
+      ignore_errors: true
+
+    # ============================================================
+    # Level 4: Debezium Connector Setup
+    # ============================================================
+    - name: Copy Debezium connector config
+      copy:
+        src: "{{ debezium_config_path }}"
+        dest: /tmp/debezium-connector.json
+        mode: '0644'
+
+    - name: Configure Debezium connector
+      uri:
+        url: "http://localhost:{{ connect_port }}/connectors"
+        method: POST
+        body: "{{ lookup('file', '/tmp/debezium-connector.json') }}"
+        body_format: json
+        headers:
+          Content-Type: application/json
+        status_code: [200, 201, 409]
+      register: debezium_result
+
+    - name: Show Debezium connector result
+      debug:
+        msg: "Debezium connector configured: {{ debezium_result.status }}"
+
+    # ============================================================
+    # SpiceDB Server
+    # ============================================================
+    - name: Start SpiceDB container
+      containers.podman.podman_container:
+        name: "{{ spicedb_container }}"
+        image: "{{ spicedb_image }}"
+        state: started
+        recreate: false
+        network:
+          - "{{ network_name }}"
+        ports:
+          - "{{ spicedb_http_port }}:8080"
+          - "{{ spicedb_metrics_port }}:9090"
+          - "{{ spicedb_grpc_port }}:50051"
+        env:
+          SPICEDB_GRPC_PRESHARED_KEY: "{{ spicedb_preshared_key }}"
+          SPICEDB_DATASTORE_ENGINE: postgres
+          SPICEDB_DATASTORE_CONN_URI: "postgres://{{ postgres_user }}:{{ postgres_password }}@{{ postgres_container }}:5432/{{ postgres_db }}?sslmode=disable"
+        command:
+          - serve
+          - --http-enabled
+          - --http-addr=0.0.0.0:8080
+
+    - name: Wait for SpiceDB to be ready
+      uri:
+        url: "http://localhost:{{ spicedb_http_port }}/healthz"
+        method: GET
+        status_code: [200, 204]
+      register: spicedb_ready
+      until: spicedb_ready.status in [200, 204]
+      retries: 30
+      delay: 2
+      ignore_errors: true
+
+    - name: Read schema.zed file
+      ansible.builtin.slurp:
+        src: "{{ relations_api_schema_path }}"
+      register: schema_content
+
+    - name: Write schema to SpiceDB
+      uri:
+        url: "http://localhost:{{ spicedb_http_port }}/v1/schema/write"
+        method: POST
+        body:
+          schema: "{{ schema_content.content | b64decode }}"
+        body_format: json
+        headers:
+          Content-Type: application/json
+          Authorization: "Bearer {{ spicedb_preshared_key }}"
+        status_code: [200, 201]
+      register: schema_write_result
+
+    - name: Show schema write result
+      debug:
+        msg: "Schema written to SpiceDB successfully"
+
+    # ============================================================
+    # Relations API
+    # ============================================================
+    - name: Start Relations API container
+      containers.podman.podman_container:
+        name: "{{ relations_api_container }}"
+        image: "{{ relations_api_image }}"
+        state: started
+        recreate: false
+        network:
+          - "{{ network_name }}"
+        ports:
+          - "{{ relations_api_http_port }}:8000"
+          - "{{ relations_api_grpc_port }}:9000"
+        volumes:
+          - "{{ relations_api_schema_path }}:/schema_file:ro,Z"
+        env:
+          SPICEDB_PRESHARED: "{{ spicedb_preshared_key }}"
+          SPICEDB_SCHEMA_FILE: /schema_file
+          SPICEDB_ENDPOINT: "{{ spicedb_container }}:50051"
+
+    - name: Wait for Relations API to be ready
+      uri:
+        url: "http://localhost:{{ relations_api_http_port }}/api/authz/v1/health"
+        method: GET
+        status_code: [200, 204]
+      register: relations_ready
+      until: relations_ready.status in [200, 204]
+      retries: 30
+      delay: 2
+      ignore_errors: true
+
+    # ============================================================
+    # Summary
+    # ============================================================
+    - name: Print summary
+      debug:
+        msg: |
+          Kessel infrastructure started successfully!
+
+          Services:
+            - PostgreSQL: localhost:{{ postgres_port }}
+            - Kafka (KRaft): localhost:{{ kafka_external_port }} (external), kafka:{{ kafka_internal_port }} (internal)
+            - Kafka Connect: localhost:{{ connect_port }}
+            - Inventory API: localhost:{{ inventory_http_port }} (HTTP), localhost:{{ inventory_grpc_port }} (gRPC)
+            - SpiceDB: localhost:{{ spicedb_grpc_port }} (gRPC), localhost:{{ spicedb_http_port }} (HTTP)
+            - Relations API: localhost:{{ relations_api_http_port }} (HTTP), localhost:{{ relations_api_grpc_port }} (gRPC)
+
+          Network: {{ network_name }}

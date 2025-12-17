@@ -1,0 +1,60 @@
+---
+- name: Setup Schema for Inventory API
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/main.yaml
+
+  tasks:
+    - name: Create document schema directory
+      ansible.builtin.file:
+        path: "{{ inventory_api_path }}/data/schema/resources/{{ resource_type }}/reporters/{{ reporter_name }}"
+        state: directory
+        mode: '0755'
+
+    - name: Template document config.yaml
+      ansible.builtin.template:
+        src: "{{ document_schema_path }}/config.yaml"
+        dest: "{{ inventory_api_path }}/data/schema/resources/{{ resource_type }}/config.yaml"
+        mode: '0644'
+
+    - name: Copy document common_representation.json
+      ansible.builtin.copy:
+        src: "{{ document_schema_path }}/common_representation.json"
+        dest: "{{ inventory_api_path }}/data/schema/resources/{{ resource_type }}/common_representation.json"
+        mode: '0644'
+
+    - name: Template reporter config.yaml
+      ansible.builtin.template:
+        src: "{{ document_schema_path }}/reporters/_reporter/config.yaml"
+        dest: "{{ inventory_api_path }}/data/schema/resources/{{ resource_type }}/reporters/{{ reporter_name }}/config.yaml"
+        mode: '0644'
+
+    - name: Copy reporter schema json
+      ansible.builtin.copy:
+        src: "{{ document_schema_path }}/reporters/_reporter/resource.json"
+        dest: "{{ inventory_api_path }}/data/schema/resources/{{ resource_type }}/reporters/{{ reporter_name }}/{{ resource_type }}.json"
+        mode: '0644'
+
+    - name: Preload schema cache
+      ansible.builtin.command:
+        cmd: go run main.go preload-schema
+        chdir: "{{ inventory_api_path }}"
+      register: preload_result
+      changed_when: true
+
+    - name: Show preload output
+      debug:
+        var: preload_result.stdout_lines
+      when: preload_result.stdout_lines is defined
+
+    - name: Print summary
+      debug:
+        msg: |
+          Schema setup complete!
+
+          Generated:
+            - {{ inventory_api_path }}/data/schema/resources/{{ resource_type }}/
+            - {{ inventory_api_path }}/schema_cache.json

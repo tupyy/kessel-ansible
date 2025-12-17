@@ -1,0 +1,3 @@
+type: document
+reporters:
+  - name: drive

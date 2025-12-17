@@ -1,0 +1,24 @@
+server:
+  http:
+    address: 0.0.0.0:{{ inventory_http_port }}
+  grpc:
+    address: 0.0.0.0:{{ inventory_grpc_port }}
+authn:
+  allow-unauthenticated: true
+authz:
+  impl: allow-all
+eventing:
+  eventer: stdout
+storage:
+  database: postgres
+  postgres:
+    host: "{{ postgres_container }}"
+    port: "5432"
+    user: "{{ postgres_user }}"
+    password: "{{ postgres_password }}"
+    dbname: "{{ postgres_db }}"
+consumer:
+  enabled: false
+  bootstrap-servers: {{ kafka_container }}:{{ kafka_internal_port }}
+log:
+  level: "info"

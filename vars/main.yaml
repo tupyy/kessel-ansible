@@ -1,0 +1,56 @@
+# Repository Paths
+inventory_api_path: "{{ playbook_dir }}/../inventory-api"
+document_schema_path: "{{ playbook_dir }}/templates/document"
+ksl_schema_path: "{{ playbook_dir }}/ksl"
+
+# Schema Configuration
+resource_type: document
+reporter_name: drive
+namespace: drive
+
+# Network
+network_name: kessel
+
+# PostgreSQL
+postgres_image: postgres:16
+postgres_container: invdatabase
+postgres_port: 5432
+postgres_user: postgres
+postgres_password: postgres
+postgres_db: spicedb
+
+# Kafka (KRaft mode - no Zookeeper)
+kafka_image: quay.io/strimzi/kafka:latest-kafka-3.8.0
+kafka_container: kafka
+kafka_internal_port: 9093
+kafka_external_port: 9092
+kafka_cluster_id: MkU3OEVBNTcwNTJENDM2Qk
+
+# Inventory API
+inventory_api_image: quay.io/cloudservices/kessel-inventory:latest
+invmigrate_container: invmigrate
+inventory_api_container: inventory-api
+inventory_http_port: 8081
+inventory_grpc_port: 9081
+inventory_config_path: "{{ playbook_dir }}/templates/inventory-api.yaml"
+
+# Kafka Connect (Debezium)
+connect_image: quay.io/debezium/connect:3.1
+connect_container: connect
+connect_port: 8083
+debezium_config_path: "{{ playbook_dir }}/templates/debezium-connector.json"
+
+# SpiceDB
+spicedb_image: authzed/spicedb
+spicedb_container: spicedb
+spicedb_grpc_port: 50051
+spicedb_http_port: 8080
+spicedb_metrics_port: 9090
+spicedb_preshared_key: foobar
+
+# Relations API
+relations_api_image: quay.io/cloudservices/kessel-relations:latest
+relations_api_container: relations-api
+relations_api_http_port: 8000
+relations_api_grpc_port: 9000
+relations_api_schema_path: "{{ ksl_schema_path }}/schema.zed"

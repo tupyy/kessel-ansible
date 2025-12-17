@@ -1,0 +1,2 @@
+reporter_type: {{ reporter_name }}
+reporter_version: "1.0.0"

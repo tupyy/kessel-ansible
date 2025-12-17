@@ -1,0 +1,84 @@
+---
+- name: Stop Kessel Infrastructure
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/main.yaml
+
+  tasks:
+    - name: Stop and remove Relations API container
+      containers.podman.podman_container:
+        name: "{{ relations_api_container }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Stop and remove SpiceDB container
+      containers.podman.podman_container:
+        name: "{{ spicedb_container }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Stop and remove Inventory API container
+      containers.podman.podman_container:
+        name: "{{ inventory_api_container }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Stop and remove Kafka Connect container
+      containers.podman.podman_container:
+        name: "{{ connect_container }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Stop and remove invmigrate container
+      containers.podman.podman_container:
+        name: "{{ invmigrate_container }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Stop and remove Kafka container
+      containers.podman.podman_container:
+        name: "{{ kafka_container }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Stop and remove PostgreSQL container
+      containers.podman.podman_container:
+        name: "{{ postgres_container }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Remove PostgreSQL data volume
+      containers.podman.podman_volume:
+        name: postgres-data
+        state: absent
+      ignore_errors: true
+
+    - name: Remove Kafka data volume
+      containers.podman.podman_volume:
+        name: kafka-data
+        state: absent
+      ignore_errors: true
+
+    - name: Remove Kafka logs volume
+      containers.podman.podman_volume:
+        name: kafka-logs
+        state: absent
+      ignore_errors: true
+
+    - name: Remove kessel network
+      containers.podman.podman_network:
+        name: "{{ network_name }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Cleanup temp config
+      file:
+        path: /tmp/inventory-api-config.yaml
+        state: absent
+
+    - name: Print summary
+      debug:
+        msg: "Kessel infrastructure stopped and cleaned up."
